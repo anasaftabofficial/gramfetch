@@ -7,7 +7,7 @@
  */
 declare(strict_types=1);
 
-$config = require __DIR__ . '/config.php';
+$config = require __DIR__ . '/_lib/config.php';
 
 $url    = (string) ($_GET['url'] ?? '');
 $inline = isset($_GET['inline']);
@@ -19,6 +19,15 @@ $host  = strtolower($parts['host'] ?? '');
 if (($parts['scheme'] ?? '') !== 'https' || !preg_match('/(^|\.)(cdninstagram\.com|fbcdn\.net)$/', $host)) {
     http_response_code(400);
     exit('Invalid file link.');
+}
+
+// Vercel functions cannot send responses larger than 4.5 MB, so full size
+// downloads there go straight to Instagram's CDN. dl=1 asks the CDN to send
+// the file as a download instead of opening it in the tab.
+if (getenv('VERCEL') && !$inline) {
+    header('Location: ' . $url . (strpos($url, '?') === false ? '?' : '&') . 'dl=1', true, 302);
+    header('Cache-Control: no-store');
+    exit;
 }
 
 @set_time_limit(0);

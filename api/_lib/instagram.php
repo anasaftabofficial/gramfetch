@@ -3,7 +3,8 @@ declare(strict_types=1);
 
 class IgException extends RuntimeException {}
 
-const IG_CACHE_DIR = __DIR__ . '/../cache';
+// Vercel's filesystem is read-only except /tmp
+define('IG_CACHE_DIR', getenv('VERCEL') ? sys_get_temp_dir() . '/gramfetch' : __DIR__ . '/../../cache');
 
 /** Steps recorded for debug.php */
 $GLOBALS['IG_DEBUG'] = [];

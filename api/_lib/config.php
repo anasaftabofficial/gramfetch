@@ -12,16 +12,18 @@ return [
 
     // GraphQL document ID for loading a single post. Instagram changes this
     // from time to time. If posts stop loading, update it (see README.md).
-    'graphql_doc_id' => '8845758582119845',
+    'graphql_doc_id' => getenv('IG_DOC_ID') ?: '8845758582119845',
 
-    // OPTIONAL: sessionid cookie of an Instagram account. Only needed for
-    // Stories. Use a spare account, never your main one (it can get banned).
-    'session_id'     => '',
+    // OPTIONAL: sessionid cookie of a SPARE Instagram account (never your main
+    // one, it can get banned). Needed for Stories and helps when Instagram
+    // blocks logged-out requests. On Vercel set it as the IG_SESSION_ID
+    // environment variable instead of writing it here.
+    'session_id'     => getenv('IG_SESSION_ID') ?: '',
 
     // OPTIONAL: outgoing proxy, e.g. 'http://user:pass@1.2.3.4:8080'
     // Instagram often blocks shared hosting / datacenter IPs. A residential
     // proxy fixes most "Instagram is limiting requests" errors.
-    'http_proxy'     => '',
+    'http_proxy'     => getenv('IG_HTTP_PROXY') ?: '',
 
     // How long a resolved link is cached (seconds). Instagram CDN links expire,
     // so keep this short.

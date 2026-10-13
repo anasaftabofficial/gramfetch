@@ -5,8 +5,8 @@ header('Content-Type: application/json; charset=utf-8');
 header('X-Content-Type-Options: nosniff');
 header('Cache-Control: no-store');
 
-$config = require __DIR__ . '/config.php';
-require __DIR__ . '/lib/instagram.php';
+$config = require __DIR__ . '/_lib/config.php';
+require __DIR__ . '/_lib/instagram.php';
 
 function out(array $data, int $code = 200): void
 {

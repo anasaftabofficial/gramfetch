@@ -11,14 +11,14 @@ if (!in_array($ip, ['127.0.0.1', '::1'], true)) {
     exit;
 }
 
-$config = require __DIR__ . '/config.php';
-require __DIR__ . '/lib/instagram.php';
+$config = require __DIR__ . '/api/_lib/config.php';
+require __DIR__ . '/api/_lib/instagram.php';
 
 $url = trim((string) ($_GET['url'] ?? ''));
 header('Content-Type: text/html; charset=utf-8');
 
 // Clear cached tokens/results so every run is fresh
-foreach (array_merge(glob(__DIR__ . '/cache/c_*.json') ?: [], glob(__DIR__ . '/cache/debug-*.html') ?: []) as $f) {
+foreach (array_merge(glob(IG_CACHE_DIR . '/c_*.json') ?: [], glob(IG_CACHE_DIR . '/debug-*.html') ?: []) as $f) {
     @unlink($f);
 }
 $GLOBALS['IG_DEBUG_DUMP'] = true;
@@ -37,8 +37,8 @@ $checks = [
     'PHP version'      => PHP_VERSION,
     'curl extension'   => extension_loaded('curl') ? 'yes' : 'NO (enable extension=curl in php.ini)',
     'curl SSL version' => function_exists('curl_version') ? (curl_version()['ssl_version'] ?? '?') : '-',
-    'cacert.pem in lib'=> is_file(__DIR__ . '/lib/cacert.pem') ? 'yes' : 'no',
-    'cache writable'   => is_writable(__DIR__ . '/cache') ? 'yes' : 'NO',
+    'cacert.pem in api/_lib'=> is_file(__DIR__ . '/api/_lib/cacert.pem') ? 'yes' : 'no',
+    'cache writable'   => is_writable(cache_dir()) ? 'yes' : 'NO',
     'proxy set'        => $config['http_proxy'] ? 'yes' : 'no',
 ];
 ?>
@@ -76,7 +76,7 @@ code{font-size:12px;word-break:break-all}
 </tr>
 <?php endforeach; ?>
 </table>
-<?php $dumps = glob(__DIR__ . '/cache/debug-*.html') ?: []; if ($dumps): ?>
+<?php $dumps = glob(IG_CACHE_DIR . '/debug-*.html') ?: []; if ($dumps): ?>
 <h2>Saved responses</h2>
 <p>These files are saved on your computer in the <code>gramfetch\cache</code> folder. If the result is not a success, send them along with a screenshot.</p>
 <ul><?php foreach ($dumps as $d): ?><li><code><?= htmlspecialchars(basename($d)) ?></code> (<?= round(filesize($d) / 1024) ?> KB)</li><?php endforeach; ?></ul>

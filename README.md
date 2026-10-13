@@ -34,16 +34,28 @@ location = /config.php { deny all; }
 |---|---|
 | `index.html` | Tool page with tabs and SEO content |
 | `app.js` | Tabs, paste button, calls `api.php`, renders results |
-| `api.php` | Takes the link, returns JSON with media URLs |
-| `lib/instagram.php` | Talks to Instagram, cache, rate limit |
-| `proxy.php` | Streams the file so the browser saves it (only allows Instagram CDN hosts) |
-| `config.php` | Settings |
+| `api/download.php` | Takes the link, returns JSON with media URLs |
+| `api/_lib/instagram.php` | Talks to Instagram, cache, rate limit |
+| `api/proxy.php` | Streams the file so the browser saves it (only allows Instagram CDN hosts) |
+| `api/_lib/config.php` | Settings (can also come from environment variables) |
+
+## Deploy on Vercel
+
+`vercel.json` runs the PHP files in `api/` with the community `vercel-php` runtime. Push to GitHub and Vercel redeploys on its own.
+
+Set these in Vercel > Project > Settings > Environment Variables (never commit them):
+
+* `IG_SESSION_ID`: sessionid cookie of a spare Instagram account (optional, helps a lot on Vercel)
+* `IG_HTTP_PROXY`: residential proxy URL (optional)
+* `IG_DOC_ID`: new GraphQL doc_id if Instagram changes it (optional)
+
+Limits on Vercel: functions cannot return more than 4.5 MB, so full downloads are redirected to Instagram's CDN with `dl=1` instead of streaming through the server. Vercel runs on datacenter IPs, which Instagram blocks more often than home connections.
 
 ## Debugging
 
 On your own computer (XAMPP) open `http://localhost/gramfetch/debug.php?url=INSTAGRAM_LINK`. It shows each request sent to Instagram with its status code. The page only works on localhost.
 
-If you see an SSL or certificate error, download `cacert.pem` from https://curl.se/docs/caextract.html and put it in the `lib` folder.
+If you see an SSL or certificate error, download `cacert.pem` from https://curl.se/docs/caextract.html and put it in the `api/_lib` folder.
 
 ## Important: how reliable is this?
 

@@ -76,7 +76,7 @@
     setLoading(true);
     var body = new URLSearchParams({ url: url, type: currentType });
 
-    fetch('api.php', { method: 'POST', body: body })
+    fetch('api/download.php', { method: 'POST', body: body })
       .then(function (r) { return r.json().catch(function () { return { ok: false, error: 'Server error. Please try again.' }; }); })
       .then(function (data) {
         if (!data.ok) { showError(data.error || 'Could not fetch this link.'); results.hidden = true; return; }
@@ -87,7 +87,7 @@
   });
 
   function proxyUrl(src, name, inline) {
-    var q = 'proxy.php?url=' + encodeURIComponent(src);
+    var q = 'api/proxy.php?url=' + encodeURIComponent(src);
     if (name) q += '&name=' + encodeURIComponent(name);
     if (inline) q += '&inline=1';
     return q;
