@@ -18,9 +18,10 @@ $url = trim((string) ($_GET['url'] ?? ''));
 header('Content-Type: text/html; charset=utf-8');
 
 // Clear cached tokens/results so every run is fresh
-foreach (glob(__DIR__ . '/cache/c_*.json') ?: [] as $f) {
+foreach (array_merge(glob(__DIR__ . '/cache/c_*.json') ?: [], glob(__DIR__ . '/cache/debug-*.html') ?: []) as $f) {
     @unlink($f);
 }
+$GLOBALS['IG_DEBUG_DUMP'] = true;
 
 $result = null;
 $error  = null;
@@ -75,6 +76,11 @@ code{font-size:12px;word-break:break-all}
 </tr>
 <?php endforeach; ?>
 </table>
+<?php $dumps = glob(__DIR__ . '/cache/debug-*.html') ?: []; if ($dumps): ?>
+<h2>Saved responses</h2>
+<p>These files are saved on your computer in the <code>gramfetch\cache</code> folder. If the result is not a success, send them along with a screenshot.</p>
+<ul><?php foreach ($dumps as $d): ?><li><code><?= htmlspecialchars(basename($d)) ?></code> (<?= round(filesize($d) / 1024) ?> KB)</li><?php endforeach; ?></ul>
+<?php endif; ?>
 <p>Take a screenshot of this page and share it if the result is not a success.</p>
 <?php endif; ?>
 </body></html>

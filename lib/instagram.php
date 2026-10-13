@@ -189,7 +189,7 @@ function ig_resolve(string $input, string $type, array $config): array
 function ig_post(string $shortcode, array $config): array
 {
     // Try each method in turn; Instagram blocks some of them depending on IP
-    $methods = ['ig_post_graphql', 'ig_post_api', 'ig_post_embed', 'ig_post_page'];
+    $methods = ['ig_post_page', 'ig_post_embed', 'ig_post_graphql', 'ig_post_media_info'];
     foreach ($methods as $fn) {
         try {
             $media = $fn($shortcode, $config);
@@ -240,7 +240,7 @@ function ig_post_graphql(string $shortcode, array $config): ?array
         'step'    => 'graphql',
         'post'    => http_build_query($post),
         'headers' => $headers,
-        'cookie'  => $t['cookie'],
+        'cookie'  => trim($t['cookie'] . ($config['session_id'] ? '; sessionid=' . $config['session_id'] : ''), '; '),
     ]);
     if ($code !== 200) {
         return null;
@@ -248,33 +248,6 @@ function ig_post_graphql(string $shortcode, array $config): ?array
     $json  = json_decode($body, true);
     $media = $json['data']['xdt_shortcode_media'] ?? $json['data']['shortcode_media'] ?? null;
     return is_array($media) ? ig_format_post($media, $shortcode) : null;
-}
-
-/** Method 2: the ?__a=1 JSON view of the post page */
-function ig_post_api(string $shortcode, array $config): ?array
-{
-    $t = ig_web_tokens($config);
-    [$code, $body] = ig_http('https://www.instagram.com/p/' . $shortcode . '/?__a=1&__d=dis', $config, [
-        'step'    => '__a=1 json',
-        'headers' => ['X-IG-App-ID: ' . $config['ig_app_id'], 'X-Requested-With: XMLHttpRequest'],
-        'cookie'  => $t['cookie'],
-    ]);
-    if ($code !== 200) {
-        return null;
-    }
-    $json = json_decode($body, true);
-    if (!is_array($json)) {
-        return null;
-    }
-    // Old graphql shape
-    if (isset($json['graphql']['shortcode_media'])) {
-        return ig_format_post($json['graphql']['shortcode_media'], $shortcode);
-    }
-    // Newer "items" shape (same as the private media/info API)
-    if (!empty($json['items'][0])) {
-        return ig_format_api_item($json['items'][0]);
-    }
-    return null;
 }
 
 /** Method 3: the public embed page */
@@ -294,28 +267,10 @@ function ig_post_embed(string $shortcode, array $config): ?array
         }
     }
 
-    // b) URLs scattered through escaped JSON in <script> tags
-    $flat   = ig_unescape($html);
-    $videos = [];
-    $images = [];
-    if (preg_match_all('/"video_url":"(https:[^"]+)"/', $flat, $m)) {
-        $videos = array_values(array_unique($m[1]));
-    }
-    if (preg_match_all('/"display_url":"(https:[^"]+)"/', $flat, $m)) {
-        $images = array_values(array_unique($m[1]));
-    }
-    if ($videos || $images) {
-        $items = [];
-        foreach ($videos as $i => $v) {
-            $items[] = ['type' => 'video', 'url' => $v, 'thumb' => $images[$i] ?? ''];
-        }
-        if (!$videos) {
-            foreach ($images as $img) {
-                $items[] = ['type' => 'image', 'url' => $img, 'thumb' => $img];
-            }
-        }
-        $user = preg_match('/"username":"([A-Za-z0-9._]+)"/', $flat, $um) ? $um[1] : '';
-        return ['title' => 'Instagram post', 'username' => $user, 'items' => $items];
+    // b) any other known format
+    ig_debug_dump('embed', $html);
+    if ($media = ig_media_from_html($html)) {
+        return $media;
     }
 
     // c) single image tag (photo posts only)
@@ -330,24 +285,151 @@ function ig_post_embed(string $shortcode, array $config): ?array
     return null;
 }
 
-/** Method 4: normal post page, Open Graph tags (photo posts only) */
+/** Post page: logged-out HTML now carries the media JSON in data-sjs scripts */
 function ig_post_page(string $shortcode, array $config): ?array
 {
-    [$code, $html] = ig_http('https://www.instagram.com/p/' . $shortcode . '/', $config, ['step' => 'post page og tags']);
+    $cookie = $config['session_id'] ? 'sessionid=' . $config['session_id'] : '';
+    [$code, $html] = ig_http('https://www.instagram.com/p/' . $shortcode . '/', $config, [
+        'step'   => 'post page',
+        'cookie' => $cookie,
+        'headers'=> ['Accept: text/html,application/xhtml+xml', 'Sec-Fetch-Mode: navigate', 'Sec-Fetch-Dest: document'],
+    ]);
     if ($code !== 200) {
         return null;
     }
-    $flat = ig_unescape($html);
-    if (preg_match('/"video_url":"(https:[^"]+)"/', $flat, $vm)) {
-        $thumb = preg_match('/<meta property="og:image" content="([^"]+)"/', $html, $im) ? html_entity_decode($im[1]) : '';
-        return ['title' => 'Instagram post', 'username' => '', 'items' => [['type' => 'video', 'url' => $vm[1], 'thumb' => $thumb]]];
+    ig_debug_dump('post-page', $html);
+    return ig_media_from_html($html);
+}
+
+/**
+ * Pulls media out of any Instagram HTML page, trying every format seen so far.
+ */
+function ig_media_from_html(string $html): ?array
+{
+    foreach ([$html, ig_unescape($html)] as $src) {
+        // a) v1 "web_info" object (current logged-out post page)
+        $info = ig_json_after($src, 'xdt_api__v1__media__shortcode__web_info');
+        if (!empty($info['items'][0])) {
+            return ig_format_api_item($info['items'][0]);
+        }
+        // b) GraphQL shortcode_media objects
+        foreach (['xdt_shortcode_media', 'shortcode_media'] as $k) {
+            $m = ig_json_after($src, $k);
+            if ($m && (isset($m['display_url']) || isset($m['video_url']))) {
+                return ig_format_post($m, '');
+            }
+        }
     }
-    $isVideo = (bool) preg_match('/<meta property="og:type" content="video/i', $html);
-    if (!$isVideo && preg_match('/<meta property="og:image" content="([^"]+)"/', $html, $m)) {
-        $img = html_entity_decode($m[1]);
-        return ['title' => 'Instagram post', 'username' => '', 'items' => [['type' => 'image', 'url' => $img, 'thumb' => $img]]];
+
+    // c) loose URL scan
+    $flat   = ig_unescape($html);
+    $videos = [];
+    if (preg_match_all('/"video_versions":\[\{[^\]]*?"url":"(https:[^"]+)"/', $flat, $m)) {
+        $videos = $m[1];
+    }
+    if (preg_match_all('/"video_url":"(https:[^"]+)"/', $flat, $m)) {
+        $videos = array_merge($videos, $m[1]);
+    }
+    $videos = array_values(array_unique($videos));
+    $thumb  = ig_meta($html, 'og:image');
+    if ($videos) {
+        $items = array_map(fn($v) => ['type' => 'video', 'url' => $v, 'thumb' => $thumb], $videos);
+        return ['title' => 'Instagram post', 'username' => '', 'items' => $items];
+    }
+
+    // d) Open Graph image for photo posts
+    $type = ig_meta($html, 'og:type');
+    if ($thumb !== '' && stripos($type, 'video') === false) {
+        return ['title' => 'Instagram post', 'username' => '', 'items' => [['type' => 'image', 'url' => $thumb, 'thumb' => $thumb]]];
     }
     return null;
+}
+
+/** <meta property="x" content="y"> in either attribute order */
+function ig_meta(string $html, string $prop): string
+{
+    $p = preg_quote($prop, '/');
+    if (preg_match('/<meta[^>]+property="' . $p . '"[^>]+content="([^"]*)"/i', $html, $m)
+        || preg_match('/<meta[^>]+content="([^"]*)"[^>]+property="' . $p . '"/i', $html, $m)) {
+        return html_entity_decode($m[1]);
+    }
+    return '';
+}
+
+/** Decode the JSON object that follows "key": in a big HTML/JS string */
+function ig_json_after(string $s, string $key): ?array
+{
+    $pos = 0;
+    while (($p = strpos($s, '"' . $key . '":', $pos)) !== false) {
+        $pos   = $p + 1;
+        $start = $p + strlen($key) + 3;
+        while (isset($s[$start]) && ctype_space($s[$start])) {
+            $start++;
+        }
+        if (($s[$start] ?? '') !== '{') {
+            continue;
+        }
+        $depth = 0;
+        $inStr = false;
+        $len   = strlen($s);
+        for ($i = $start; $i < $len; $i++) {
+            $c = $s[$i];
+            if ($inStr) {
+                if ($c === '\\') { $i++; continue; }
+                if ($c === '"') { $inStr = false; }
+                continue;
+            }
+            if ($c === '"') { $inStr = true; continue; }
+            if ($c === '{') { $depth++; }
+            if ($c === '}' && --$depth === 0) {
+                $data = json_decode(substr($s, $start, $i - $start + 1), true);
+                if (is_array($data)) {
+                    return $data;
+                }
+                break;
+            }
+        }
+    }
+    return null;
+}
+
+/** Saves raw responses into cache/ while debug.php is running */
+function ig_debug_dump(string $name, string $body): void
+{
+    if (!empty($GLOBALS['IG_DEBUG_DUMP'])) {
+        @file_put_contents(cache_dir() . '/debug-' . $name . '.html', $body);
+    }
+}
+
+/** Shortcode to numeric media id (Instagram's base64 alphabet) */
+function ig_shortcode_to_id(string $shortcode): string
+{
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    $code = substr($shortcode, 0, 11);
+    $id = 0; // fits in 64-bit PHP for all current shortcodes
+    foreach (str_split($code) as $ch) {
+        $id = $id * 64 + (int) strpos($alphabet, $ch);
+    }
+    return (string) $id;
+}
+
+/** Logged-in media/info API. Used only when session_id is set in config.php */
+function ig_post_media_info(string $shortcode, array $config): ?array
+{
+    if (empty($config['session_id']) || PHP_INT_SIZE < 8) {
+        return null;
+    }
+    [$code, $body] = ig_http('https://i.instagram.com/api/v1/media/' . ig_shortcode_to_id($shortcode) . '/info/', $config, [
+        'step'    => 'media info (login)',
+        'ua'      => $config['mobile_agent'],
+        'headers' => ['X-IG-App-ID: ' . $config['ig_app_id']],
+        'cookie'  => 'sessionid=' . $config['session_id'],
+    ]);
+    if ($code !== 200) {
+        return null;
+    }
+    $json = json_decode($body, true);
+    return !empty($json['items'][0]) ? ig_format_api_item($json['items'][0]) : null;
 }
 
 /** Format an item from Instagram's v1 API shape */
