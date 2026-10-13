@@ -39,6 +39,12 @@ location = /config.php { deny all; }
 | `proxy.php` | Streams the file so the browser saves it (only allows Instagram CDN hosts) |
 | `config.php` | Settings |
 
+## Debugging
+
+On your own computer (XAMPP) open `http://localhost/gramfetch/debug.php?url=INSTAGRAM_LINK`. It shows each request sent to Instagram with its status code. The page only works on localhost.
+
+If you see an SSL or certificate error, download `cacert.pem` from https://curl.se/docs/caextract.html and put it in the `lib` folder.
+
 ## Important: how reliable is this?
 
 Instagram has no official download API. Every downloader site (including the big ones) uses Instagram's own web endpoints, and Instagram actively blocks them. Expect these issues:

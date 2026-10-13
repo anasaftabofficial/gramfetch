@@ -5,6 +5,19 @@ class IgException extends RuntimeException {}
 
 const IG_CACHE_DIR = __DIR__ . '/../cache';
 
+/** Steps recorded for debug.php */
+$GLOBALS['IG_DEBUG'] = [];
+
+function ig_log(string $step, int $code, string $body, string $note = ''): void
+{
+    $GLOBALS['IG_DEBUG'][] = [
+        'step'    => $step,
+        'status'  => $code,
+        'note'    => $note,
+        'preview' => mb_substr(preg_replace('/\s+/', ' ', strip_tags($body)), 0, 300),
+    ];
+}
+
 /* ---------------------------------------------------------------
  * HTTP
  * ------------------------------------------------------------- */
@@ -14,6 +27,7 @@ function ig_http(string $url, array $config, array $opts = []): array
     $headers = $opts['headers'] ?? [];
     $headers[] = 'Accept-Language: en-US,en;q=0.9';
 
+    $respHeaders = [];
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
@@ -23,7 +37,16 @@ function ig_http(string $url, array $config, array $opts = []): array
         CURLOPT_ENCODING       => '',
         CURLOPT_USERAGENT      => $opts['ua'] ?? $config['user_agent'],
         CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_HEADERFUNCTION => function ($ch, $h) use (&$respHeaders) {
+            $respHeaders[] = $h;
+            return strlen($h);
+        },
     ]);
+    // XAMPP on Windows often ships without a CA bundle. If a cacert.pem
+    // sits next to this file, use it.
+    if (is_file(__DIR__ . '/cacert.pem')) {
+        curl_setopt($ch, CURLOPT_CAINFO, __DIR__ . '/cacert.pem');
+    }
     if (!empty($opts['post'])) {
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_POSTFIELDS, $opts['post']);
@@ -41,12 +64,57 @@ function ig_http(string $url, array $config, array $opts = []): array
     curl_close($ch);
 
     if ($body === false) {
+        ig_log($opts['step'] ?? $url, 0, '', 'curl error: ' . $err);
         throw new IgException('Could not reach Instagram. Please try again. (' . $err . ')', 502);
     }
+    ig_log($opts['step'] ?? $url, $code, (string) $body);
     if ($code === 429 || $code === 401) {
         throw new IgException('Instagram is limiting requests right now. Please try again in a few minutes.', 429);
     }
-    return [$code, (string) $body];
+    return [$code, (string) $body, implode('', $respHeaders)];
+}
+
+/**
+ * Logged-out instagram.com sets a csrftoken cookie and embeds an LSD token.
+ * Newer GraphQL calls are rejected without them.
+ */
+function ig_web_tokens(array $config): array
+{
+    if ($cached = cache_get('tokens', 3600)) {
+        return $cached;
+    }
+    [, $body, $headers] = ig_http('https://www.instagram.com/', $config, ['step' => 'homepage tokens']);
+
+    $csrf = '';
+    if (preg_match('/csrftoken=([^;\s]+)/i', $headers, $m) || preg_match('/"csrf_token":"([^"]+)"/', $body, $m)) {
+        $csrf = $m[1];
+    }
+    $lsd = '';
+    if (preg_match('/"LSD",\[\],\{"token":"([^"]+)"/', $body, $m) || preg_match('/"lsd":"([^"]+)"/', $body, $m)) {
+        $lsd = $m[1];
+    }
+    $cookies = [];
+    if (preg_match_all('/^set-cookie:\s*([^=;\s]+)=([^;\r\n]*)/im', $headers, $mm, PREG_SET_ORDER)) {
+        foreach ($mm as $c) {
+            $cookies[$c[1]] = $c[1] . '=' . $c[2];
+        }
+    }
+    $tokens = ['csrf' => $csrf, 'lsd' => $lsd, 'cookie' => implode('; ', $cookies)];
+    if ($csrf !== '' || $lsd !== '') {
+        cache_set('tokens', $tokens);
+    }
+    return $tokens;
+}
+
+/** Undo the JSON escaping Instagram uses inside HTML (\/, \", &) */
+function ig_unescape(string $s): string
+{
+    for ($i = 0; $i < 3 && strpos($s, '\\') !== false; $i++) {
+        $s = str_replace('\\\\', '\\', $s);
+        $s = preg_replace_callback('/\\\\u([0-9a-fA-F]{4})/', fn($m) => mb_chr(hexdec($m[1]), 'UTF-8'), $s);
+        $s = str_replace(['\\/', '\\"'], ['/', '"'], $s);
+    }
+    return $s;
 }
 
 /* ---------------------------------------------------------------
@@ -120,60 +188,104 @@ function ig_resolve(string $input, string $type, array $config): array
  * ------------------------------------------------------------- */
 function ig_post(string $shortcode, array $config): array
 {
-    $media = ig_post_graphql($shortcode, $config) ?? ig_post_embed($shortcode, $config);
-
-    if ($media === null) {
-        throw new IgException('Could not load this post. It may be private, deleted, or Instagram blocked the request.', 404);
+    // Try each method in turn; Instagram blocks some of them depending on IP
+    $methods = ['ig_post_graphql', 'ig_post_api', 'ig_post_embed', 'ig_post_page'];
+    foreach ($methods as $fn) {
+        try {
+            $media = $fn($shortcode, $config);
+        } catch (IgException $e) {
+            if ($e->getCode() !== 429) {
+                throw $e;
+            }
+            $media = null; // rate limited on this method, try the next one
+        }
+        if ($media !== null && !empty($media['items'])) {
+            return $media;
+        }
     }
-    return $media;
+    throw new IgException('Could not load this post. It may be private, deleted, or Instagram blocked the request.', 404);
 }
 
+/** Method 1: GraphQL with csrftoken + LSD tokens (what instagram.com itself does) */
 function ig_post_graphql(string $shortcode, array $config): ?array
 {
+    $t = ig_web_tokens($config);
     $variables = json_encode([
         'shortcode'               => $shortcode,
         'fetch_tagged_user_count' => null,
         'hoisted_comment_id'      => null,
         'hoisted_reply_id'        => null,
     ]);
-
-    try {
-        [$code, $body] = ig_http('https://www.instagram.com/graphql/query', $config, [
-            'post'    => http_build_query(['variables' => $variables, 'doc_id' => $config['graphql_doc_id']]),
-            'headers' => [
-                'Content-Type: application/x-www-form-urlencoded',
-                'X-IG-App-ID: ' . $config['ig_app_id'],
-                'X-FB-Friendly-Name: PolarisPostActionLoadPostQueryQuery',
-                'Referer: https://www.instagram.com/p/' . $shortcode . '/',
-                'Origin: https://www.instagram.com',
-            ],
-        ]);
-    } catch (IgException $e) {
-        if ($e->getCode() === 429) {
-            return null; // try embed fallback
-        }
-        throw $e;
+    $post = ['variables' => $variables, 'doc_id' => $config['graphql_doc_id']];
+    if ($t['lsd'] !== '') {
+        $post['lsd'] = $t['lsd'];
+    }
+    $headers = [
+        'Content-Type: application/x-www-form-urlencoded',
+        'X-IG-App-ID: ' . $config['ig_app_id'],
+        'X-ASBD-ID: 129477',
+        'X-FB-Friendly-Name: PolarisPostActionLoadPostQueryQuery',
+        'Referer: https://www.instagram.com/p/' . $shortcode . '/',
+        'Origin: https://www.instagram.com',
+        'Sec-Fetch-Site: same-origin',
+    ];
+    if ($t['csrf'] !== '') {
+        $headers[] = 'X-CSRFToken: ' . $t['csrf'];
+    }
+    if ($t['lsd'] !== '') {
+        $headers[] = 'X-FB-LSD: ' . $t['lsd'];
     }
 
+    [$code, $body] = ig_http('https://www.instagram.com/graphql/query', $config, [
+        'step'    => 'graphql',
+        'post'    => http_build_query($post),
+        'headers' => $headers,
+        'cookie'  => $t['cookie'],
+    ]);
     if ($code !== 200) {
         return null;
     }
     $json  = json_decode($body, true);
     $media = $json['data']['xdt_shortcode_media'] ?? $json['data']['shortcode_media'] ?? null;
-    if (!is_array($media)) {
-        return null;
-    }
-    return ig_format_post($media, $shortcode);
+    return is_array($media) ? ig_format_post($media, $shortcode) : null;
 }
 
+/** Method 2: the ?__a=1 JSON view of the post page */
+function ig_post_api(string $shortcode, array $config): ?array
+{
+    $t = ig_web_tokens($config);
+    [$code, $body] = ig_http('https://www.instagram.com/p/' . $shortcode . '/?__a=1&__d=dis', $config, [
+        'step'    => '__a=1 json',
+        'headers' => ['X-IG-App-ID: ' . $config['ig_app_id'], 'X-Requested-With: XMLHttpRequest'],
+        'cookie'  => $t['cookie'],
+    ]);
+    if ($code !== 200) {
+        return null;
+    }
+    $json = json_decode($body, true);
+    if (!is_array($json)) {
+        return null;
+    }
+    // Old graphql shape
+    if (isset($json['graphql']['shortcode_media'])) {
+        return ig_format_post($json['graphql']['shortcode_media'], $shortcode);
+    }
+    // Newer "items" shape (same as the private media/info API)
+    if (!empty($json['items'][0])) {
+        return ig_format_api_item($json['items'][0]);
+    }
+    return null;
+}
+
+/** Method 3: the public embed page */
 function ig_post_embed(string $shortcode, array $config): ?array
 {
-    [$code, $html] = ig_http('https://www.instagram.com/p/' . $shortcode . '/embed/captioned/', $config);
+    [$code, $html] = ig_http('https://www.instagram.com/p/' . $shortcode . '/embed/captioned/', $config, ['step' => 'embed page']);
     if ($code !== 200 || $html === '') {
         return null;
     }
 
-    // Newer embed pages carry the full post JSON in "contextJSON"
+    // a) full post JSON in "contextJSON"
     if (preg_match('/"contextJSON":("(?:[^"\\\\]|\\\\.)*")/s', $html, $m)) {
         $ctx   = json_decode((string) json_decode($m[1]), true);
         $media = $ctx['gql_data']['shortcode_media'] ?? $ctx['context']['media'] ?? null;
@@ -182,7 +294,31 @@ function ig_post_embed(string $shortcode, array $config): ?array
         }
     }
 
-    // Fallback: single image only
+    // b) URLs scattered through escaped JSON in <script> tags
+    $flat   = ig_unescape($html);
+    $videos = [];
+    $images = [];
+    if (preg_match_all('/"video_url":"(https:[^"]+)"/', $flat, $m)) {
+        $videos = array_values(array_unique($m[1]));
+    }
+    if (preg_match_all('/"display_url":"(https:[^"]+)"/', $flat, $m)) {
+        $images = array_values(array_unique($m[1]));
+    }
+    if ($videos || $images) {
+        $items = [];
+        foreach ($videos as $i => $v) {
+            $items[] = ['type' => 'video', 'url' => $v, 'thumb' => $images[$i] ?? ''];
+        }
+        if (!$videos) {
+            foreach ($images as $img) {
+                $items[] = ['type' => 'image', 'url' => $img, 'thumb' => $img];
+            }
+        }
+        $user = preg_match('/"username":"([A-Za-z0-9._]+)"/', $flat, $um) ? $um[1] : '';
+        return ['title' => 'Instagram post', 'username' => $user, 'items' => $items];
+    }
+
+    // c) single image tag (photo posts only)
     if (preg_match('/class="EmbeddedMediaImage"[^>]*src="([^"]+)"/', $html, $m)) {
         $img = html_entity_decode($m[1]);
         return [
@@ -192,6 +328,46 @@ function ig_post_embed(string $shortcode, array $config): ?array
         ];
     }
     return null;
+}
+
+/** Method 4: normal post page, Open Graph tags (photo posts only) */
+function ig_post_page(string $shortcode, array $config): ?array
+{
+    [$code, $html] = ig_http('https://www.instagram.com/p/' . $shortcode . '/', $config, ['step' => 'post page og tags']);
+    if ($code !== 200) {
+        return null;
+    }
+    $flat = ig_unescape($html);
+    if (preg_match('/"video_url":"(https:[^"]+)"/', $flat, $vm)) {
+        $thumb = preg_match('/<meta property="og:image" content="([^"]+)"/', $html, $im) ? html_entity_decode($im[1]) : '';
+        return ['title' => 'Instagram post', 'username' => '', 'items' => [['type' => 'video', 'url' => $vm[1], 'thumb' => $thumb]]];
+    }
+    $isVideo = (bool) preg_match('/<meta property="og:type" content="video/i', $html);
+    if (!$isVideo && preg_match('/<meta property="og:image" content="([^"]+)"/', $html, $m)) {
+        $img = html_entity_decode($m[1]);
+        return ['title' => 'Instagram post', 'username' => '', 'items' => [['type' => 'image', 'url' => $img, 'thumb' => $img]]];
+    }
+    return null;
+}
+
+/** Format an item from Instagram's v1 API shape */
+function ig_format_api_item(array $it): array
+{
+    $nodes = !empty($it['carousel_media']) ? $it['carousel_media'] : [$it];
+    $items = [];
+    foreach ($nodes as $n) {
+        $img   = $n['image_versions2']['candidates'][0]['url'] ?? '';
+        $video = $n['video_versions'][0]['url'] ?? '';
+        if ($video || $img) {
+            $items[] = ['type' => $video ? 'video' : 'image', 'url' => $video ?: $img, 'thumb' => $img];
+        }
+    }
+    $caption = $it['caption']['text'] ?? '';
+    return [
+        'title'    => $caption !== '' ? mb_substr($caption, 0, 140) : 'Instagram post',
+        'username' => $it['user']['username'] ?? '',
+        'items'    => $items,
+    ];
 }
 
 function ig_format_post(array $media, string $shortcode): array
